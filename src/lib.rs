@@ -8,6 +8,7 @@ mod cosmic_helper;
 #[path = "diagnostics.rs"]
 mod diagnostics_impl;
 mod gnome_extension;
+mod guide;
 mod identity;
 pub mod indicator;
 mod keyboard_keymap;

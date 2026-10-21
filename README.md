@@ -79,6 +79,27 @@ The crate was extracted from [`codex-desktop-linux`](https://github.com/avifenes
 | **Opt-in host tools** | `complete_interaction` | Parameter-free desktop completion notification (`notify-send`); registered only when `COMPUTER_USE_LINUX_NOTIFY_ON_COMPLETE=1`. |
 | | `run_shell` | Bounded non-login `/bin/sh -c` execution; registered only when `COMPUTER_USE_LINUX_ENABLE_SHELL=1` (absent by default). |
 
+### Guide mode: the agent teaches, you act
+
+Run the server in **guide mode** to use an agent as a teacher looking over your shoulder, for example while learning to reverse engineer a binary in Ghidra. The agent sees your screen and accessibility tree, explains the next step, and points at the control to use; you do the clicking and typing yourself.
+
+```bash
+computer-use-linux guide                # same as: computer-use-linux mcp --mode guide
+COMPUTER_USE_LINUX_MODE=guide computer-use-linux mcp
+```
+
+Register that command with your MCP host the same way as the default server (for example `claude mcp add --scope user computer-use-linux-guide -- computer-use-linux guide`). The default mode stays `control`; `--mode`/`--guide` on the command line overrides the environment variable.
+
+In guide mode every input and window-changing tool (`click`, `drag`, `scroll`, `press_key`, `type_text`, `perform_action`, `set_value`, `activate_window`, `move_window`, `resize_window`, and `run_shell`) is absent from `tools/list`, so the agent cannot act for you. Observation and diagnostics tools stay, and three guide tools are added:
+
+| Tool | What it does |
+| --- | --- |
+| `show_guidance` | Shows a persistent on-screen hint: a pulsing pointer at the target, an outline around the target element, and a card with the `instruction`, any `keys` chord to press, and any `text_to_type`. Target by `element_index`, a `role`/`name`/`text`/`states` selector, or `x`/`y` desktop coordinates (`relative: true` with a window target for window-crop pixels). Returns `overlay_shown: false` when no overlay is available so the agent describes the location in words instead. |
+| `clear_guidance` | Removes the hint. |
+| `wait_for_user` | Waits (default 60 s, max 300 s) until you change something it can observe: the focused window or its title, the focused element, or the watched app's accessibility tree. The change must stay stable for `settle_ms` (default 1500 ms) so typing finishes first. Returns plain-language `changes`, clears the hint by default, and accepts `screenshot_after`/`include_tree` to verify the step in one call. It never records pointer or keyboard events. |
+
+A typical step: `get_app_state` → explain → `show_guidance` → `wait_for_user` → confirm or correct → next step. The server's MCP instructions in guide mode tell the agent to work this way. Hints stay up until replaced, cleared, or ten minutes pass, and are hidden during screenshots like the activity indicator. Ghidra and other Java apps expose an accessibility tree only with the Java ATK bridge (`java-atk-wrapper`) enabled; without it the agent points by screenshot coordinates. On GNOME, rerun `setup_window_targeting` and log out and back in after updating so the extension can draw hints.
+
 ### Post-action observation in one round trip
 
 All mutating tools (`click`, `drag`, `scroll`, `press_key`, `type_text`, `perform_action`, `set_value`, `activate_window`, `move_window`, and `resize_window`) accept optional post-action observation parameters so an action and its verification complete in a single MCP tool call:
@@ -455,6 +476,7 @@ Most setups need none of these — `doctor` and the installers pick sensible def
 
 | Variable | Effect |
 | --- | --- |
+| `COMPUTER_USE_LINUX_MODE` | `control` (default) or `guide`. Guide mode removes every input tool and adds `show_guidance`, `clear_guidance`, and `wait_for_user`; see [Guide mode](#guide-mode-the-agent-teaches-you-act). `computer-use-linux mcp --mode …` overrides it. |
 | `COMPUTER_USE_LINUX_NOTIFY_ON_COMPLETE` | Set exactly to `1` to expose the optional `complete_interaction` notification tool. Requires `notify-send` and a desktop notification service; disabled by default. |
 | `COMPUTER_USE_LINUX_COSMIC_HELPER` | Path to the `computer-use-linux-cosmic` helper when it isn't next to the binary or on `PATH`. |
 | `COMPUTER_USE_LINUX_INDICATOR` | Set to `0` (or `false`/`off`/`no`) to turn off the on-screen indicator. On by default. |

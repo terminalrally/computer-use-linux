@@ -1,11 +1,21 @@
-use crate::{abs_pointer, atspi_tree, diagnostics, gnome_extension, screenshot, server, windows};
+use crate::{
+    abs_pointer, atspi_tree, diagnostics, gnome_extension, guide, screenshot, server, windows,
+};
 use anyhow::{Context, Result};
 
 pub(crate) async fn run_from_env() -> Result<()> {
     diagnostics::hydrate_session_bus_env();
 
     match std::env::args().nth(1).as_deref() {
-        Some("mcp") => server::serve_mcp().await,
+        Some("mcp") => {
+            let args: Vec<String> = std::env::args().skip(2).collect();
+            server::serve_mcp(mcp_mode(
+                &args,
+                std::env::var(guide::MODE_ENV).ok().as_deref(),
+            )?)
+            .await
+        }
+        Some("guide") => server::serve_mcp(guide::ServerMode::Guide).await,
         Some("guard-accessibility") => crate::accessibility_guard::run().await,
         Some("doctor") => {
             let report = diagnostics::doctor_report();
@@ -133,7 +143,7 @@ pub(crate) async fn run_from_env() -> Result<()> {
         }
         Some(command) => {
             anyhow::bail!(
-                "unknown command '{command}'. Expected one of: mcp, doctor, setup, guard-accessibility, apps, state, screenshot, windows, setup-window-targeting"
+                "unknown command '{command}'. Expected one of: mcp, guide, doctor, setup, guard-accessibility, apps, state, screenshot, windows, setup-window-targeting"
             );
         }
         None => {
@@ -141,6 +151,32 @@ pub(crate) async fn run_from_env() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Mode for `computer-use-linux mcp [--mode control|guide | --guide]`. The
+/// command line wins over `COMPUTER_USE_LINUX_MODE`.
+fn mcp_mode(args: &[String], env_mode: Option<&str>) -> Result<guide::ServerMode> {
+    let mut mode = guide::ServerMode::parse(env_mode)
+        .with_context(|| format!("invalid {}", guide::MODE_ENV))?;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--guide" => mode = guide::ServerMode::Guide,
+            "--mode" => {
+                let value = args
+                    .next()
+                    .context("--mode needs a value: control or guide")?;
+                mode = guide::ServerMode::parse(Some(value))?;
+            }
+            other => match other.strip_prefix("--mode=") {
+                Some(value) => mode = guide::ServerMode::parse(Some(value))?,
+                None => anyhow::bail!(
+                    "unknown mcp option '{other}'. Expected --mode control|guide or --guide"
+                ),
+            },
+        }
+    }
+    Ok(mode)
 }
 
 fn abs_test_report(
@@ -161,13 +197,38 @@ fn abs_test_report(
 fn print_help() {
     println!("guard-accessibility: explicit foreground accessibility hold-open; stop with Ctrl-C or SIGTERM before disabling accessibility.\n");
     println!(
-        "computer-use-linux\n\nUsage:\n  computer-use-linux mcp\n  computer-use-linux doctor\n  computer-use-linux setup\n  computer-use-linux setup-window-targeting\n  computer-use-linux apps\n  computer-use-linux state [APP_NAME]\n  computer-use-linux screenshot\n  computer-use-linux windows"
+        "computer-use-linux\n\nUsage:\n  computer-use-linux mcp [--mode control|guide]\n  computer-use-linux guide            (MCP server in guide mode: the agent points, you act)\n  computer-use-linux doctor\n  computer-use-linux setup\n  computer-use-linux setup-window-targeting\n  computer-use-linux apps\n  computer-use-linux state [APP_NAME]\n  computer-use-linux screenshot\n  computer-use-linux windows"
     );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{abs_pointer, abs_test_report};
+    use super::{abs_pointer, abs_test_report, guide::ServerMode, mcp_mode};
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn mcp_mode_comes_from_flags_then_environment() {
+        assert_eq!(mcp_mode(&[], None).unwrap(), ServerMode::Control);
+        assert_eq!(mcp_mode(&[], Some("guide")).unwrap(), ServerMode::Guide);
+        assert_eq!(
+            mcp_mode(&args(&["--guide"]), None).unwrap(),
+            ServerMode::Guide
+        );
+        assert_eq!(
+            mcp_mode(&args(&["--mode", "control"]), Some("guide")).unwrap(),
+            ServerMode::Control
+        );
+        assert_eq!(
+            mcp_mode(&args(&["--mode=guide"]), None).unwrap(),
+            ServerMode::Guide
+        );
+        assert!(mcp_mode(&args(&["--mode"]), None).is_err());
+        assert!(mcp_mode(&args(&["--fast"]), None).is_err());
+        assert!(mcp_mode(&[], Some("drive")).is_err());
+    }
 
     #[test]
     fn abs_test_report_distinguishes_requested_and_emitted_coordinates() {
