@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Guide mode (`computer-use-linux guide`, `mcp --mode guide`, or `COMPUTER_USE_LINUX_MODE=guide`) for using an agent as a teacher while you operate the desktop yourself. It removes every input and window-changing tool, uses teacher-oriented MCP instructions, and adds `show_guidance` (persistent on-screen pointer, target outline, and instruction card), `clear_guidance`, and `wait_for_user` (waits for an observable focus, window, or accessibility-tree change and reports it). The layer-shell overlay and GNOME Shell extension render guide hints; the extension version is bumped to 4, so rerun `setup_window_targeting` and log out and back in. Control mode is unchanged and remains the default.
+
 ## [0.7.22] - 2026-10-20
 
 ### Fixed

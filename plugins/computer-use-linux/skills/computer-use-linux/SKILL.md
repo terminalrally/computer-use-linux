@@ -19,6 +19,7 @@ Use this skill when:
 - You need desktop state from AT-SPI, screenshots, or compositor window metadata.
 - You are configuring the `computer-use-linux` MCP server for your agent.
 - A desktop action needs target-aware input instead of blind shell commands.
+- The user wants to be taught how to do something in a desktop app (for example Ghidra) and perform the steps themselves; use guide mode.
 
 Do not use this for remote browsers, websites, or headless automation when a browser-specific tool is available. Do not assume desktop actions are safe just because the MCP connection works.
 
@@ -182,6 +183,17 @@ are rejected. For calibration, use the repository's
 `examples/coordinate_probe.py`: select the green square from the screenshot
 and require a delivered-event `hit: true`. Do not pass widget-local `(85, 85)`
 directly to a window-relative click.
+
+### Guide mode (the user acts, you teach)
+
+When the server runs as `computer-use-linux guide` (or `mcp --mode guide`, or `COMPUTER_USE_LINUX_MODE=guide`), input tools are not available. Loop one small step at a time:
+
+1. `get_app_state` scoped to the app the user is working in.
+2. Explain the next step and why it matters.
+3. `show_guidance` with a short `instruction` and a target (`element_index`, selector, or `x`/`y`), plus `keys` or `text_to_type` when relevant. Never put secrets in `text_to_type`.
+4. `wait_for_user`, then confirm the result from `changes` (pass `screenshot_after` or `include_tree` to inspect it) before the next step. If `timed_out` is true, ask the user whether they need help instead of repeating the hint.
+
+If `overlay_shown` is false, describe the location in words. Java apps such as Ghidra need the Java ATK bridge for an accessibility tree; otherwise point by screenshot coordinates.
 
 ## Pitfalls
 
