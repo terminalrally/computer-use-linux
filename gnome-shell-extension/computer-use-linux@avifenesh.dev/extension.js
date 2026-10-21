@@ -13,6 +13,9 @@ import * as Config from 'resource:///org/gnome/shell/misc/config.js';
 const SERVICE_NAME = 'dev.avifenesh.ComputerUseLinux.WindowControl';
 const OBJECT_PATH = '/dev/avifenesh/ComputerUseLinux/WindowControl';
 const BACKEND = 'gnome-shell-extension';
+// Guide mode: a hint stays until replaced or cleared, at most this long.
+const GUIDE_LIFETIME_MS = 600000;
+const GUIDE_PULSE_MS = 1600;
 
 const WINDOW_CONTROL_XML = `
 <node>
@@ -279,6 +282,15 @@ class ActivityIndicator {
         this._bubble = new St.Label({reactive: false, can_focus: false,
             style: 'background-color: rgba(20, 23, 30, 0.96); color: #f6f7fa; ' +
                 'border-radius: 10px; padding: 8px 12px; font-size: 13px; font-family: monospace;'});
+        // Guide mode: the instruction for the user and an outline around the target.
+        this._hint = new St.Label({reactive: false, can_focus: false, visible: false,
+            style: 'background-color: rgba(20, 23, 30, 0.96); color: #f6f7fa; ' +
+                'border-radius: 12px; padding: 12px 16px; font-size: 15px; font-weight: 600; ' +
+                'max-width: 460px;'});
+        this._hint.clutter_text.line_wrap = true;
+        this._highlight = new St.Widget({reactive: false, can_focus: false, visible: false});
+        this._guide = null;
+        this._guideAt = 0;
         this._cursor = new St.DrawingArea({width: 112, height: 112,
             reactive: false, can_focus: false});
         this._cursor.connect('repaint', () => this._drawCursor());
@@ -290,8 +302,10 @@ class ActivityIndicator {
             cr.arc(56, 56, 34, 0, Math.PI * 2);
             cr.setSourceRGBA(r, g, b, 1); cr.setLineWidth(2); cr.stroke(); cr.$dispose();
         });
+        this._root.add_child(this._highlight);
         this._root.add_child(this._pulse);
         this._root.add_child(this._pill);
+        this._root.add_child(this._hint);
         this._root.add_child(this._bubble);
         this._root.add_child(this._cursor);
         this._edges = [];
@@ -309,8 +323,10 @@ class ActivityIndicator {
             'org.freedesktop.DBus', 'NameOwnerChanged', '/org/freedesktop/DBus',
             null, Gio.DBusSignalFlags.NONE, (_connection, _sender, _path, _iface, _signal, params) => {
                 const [name, , owner] = params.deep_unpack();
-                if (name === this._owner && !owner)
+                if (name === this._owner && !owner) {
+                    this._guide = null;
                     this.hide();
+                }
             });
         this._rebuildEdges();
     }
@@ -389,6 +405,81 @@ class ActivityIndicator {
         return [event.x, event.y];
     }
 
+    _logicalRegion(event) {
+        if (!Array.isArray(event.region))
+            return null;
+        const [x, y, width, height] = event.region;
+        const start = this._logicalPoint({x, y, space: event.space});
+        const end = this._logicalPoint({x: x + width, y: y + height, space: event.space});
+        if (!start || !end || end[0] - start[0] < 1 || end[1] - start[1] < 1)
+            return null;
+        return [start[0], start[1], end[0] - start[0], end[1] - start[1]];
+    }
+
+    _layoutGuide(guide) {
+        const [r, g, b] = (this._color ?? [0.3, 0.6, 1]).map(v => Math.round(v * 255));
+        const region = this._logicalRegion(guide);
+        const anchor = region ? [region[0] + region[2] / 2, region[1] + region[3] / 2] : this._point;
+        const monitor = Main.layoutManager.monitors.find(m => anchor &&
+            anchor[0] >= m.x && anchor[0] < m.x + m.width &&
+            anchor[1] >= m.y && anchor[1] < m.y + m.height) ?? Main.layoutManager.primaryMonitor;
+        if (!monitor)
+            return;
+        if (region) {
+            this._highlight.set_style(`border: 3px solid rgba(${r}, ${g}, ${b}, 0.95); ` +
+                `border-radius: 8px; background-color: rgba(${r}, ${g}, ${b}, 0.10);`);
+            this._highlight.set_position(region[0] - 6, region[1] - 6);
+            this._highlight.set_size(region[2] + 12, region[3] + 12);
+            this._highlight.show();
+        } else {
+            this._highlight.hide();
+        }
+        const lines = [typeof guide.hint === 'string' ? guide.hint : ''];
+        if (Array.isArray(guide.keys) && guide.keys.length)
+            lines.push(`Press  ${guide.keys.join(' + ')}`);
+        if (typeof guide.text === 'string' && guide.text)
+            lines.push(`Type  ${guide.text}`);
+        this._hint.text = lines.filter(Boolean).join('\n') || 'Follow the pointer';
+        this._hint.set_style(this._hint.get_style().replace(/border: [^;]*;/, '') +
+            ` border: 2px solid rgba(${r}, ${g}, ${b}, 0.85);`);
+        const [, naturalWidth] = this._hint.get_preferred_width(-1);
+        const width = Math.min(naturalWidth, 460, monitor.width - 16);
+        this._hint.set_width(width);
+        const [, height] = this._hint.get_preferred_height(width);
+        let x, y;
+        if (region) {
+            x = region[0];
+            y = region[1] + region[3] + 14;
+            if (y + height > monitor.y + monitor.height)
+                y = region[1] - 14 - height;
+        } else if (this._point) {
+            x = this._point[0] + 20;
+            y = this._point[1] + 34;
+            if (y + height > monitor.y + monitor.height)
+                y = this._point[1] - 12 - height;
+        } else {
+            x = monitor.x + (monitor.width - width) / 2;
+            y = monitor.y + 98;
+        }
+        this._hint.set_position(
+            Math.max(monitor.x + 8, Math.min(x, monitor.x + monitor.width - width - 8)),
+            Math.max(monitor.y + 8, Math.min(y, monitor.y + monitor.height - height - 8)));
+        this._hint.show();
+    }
+
+    _guidePulse() {
+        if (!this._guide || !this._point || !this._root.visible)
+            return;
+        this._clickPulse(this._point);
+        this._later(GUIDE_PULSE_MS, () => this._guidePulse());
+    }
+
+    _clearGuide() {
+        this._guide = null;
+        this._hint.hide();
+        this._highlight.hide();
+    }
+
     _layout(event, animate) {
         const point = this._logicalPoint(event);
         const monitor = Main.layoutManager.monitors.find(m => point &&
@@ -410,6 +501,8 @@ class ActivityIndicator {
                         if (Number.isFinite(event.x) && Number.isFinite(event.y) &&
                             (event.tool === 'click' || event.tool === 'drag'))
                             this._clickPulse(point);
+                        if (event.tool === 'guide')
+                            this._guidePulse();
                     }});
             } else {
                 this._cursor.set_position(point[0] - 56, point[1] - 56);
@@ -440,20 +533,47 @@ class ActivityIndicator {
             if (event[key] !== undefined && !Number.isFinite(event[key]))
                 throw new Error('Indicator coordinates must be finite');
         }
+        if (event.hint !== undefined && typeof event.hint !== 'string')
+            throw new Error('Indicator hint must be a string');
+        if (event.region !== undefined && (!Array.isArray(event.region) ||
+            event.region.length !== 4 || !event.region.every(n => Number.isFinite(n)) ||
+            event.region[2] < 0 || event.region[3] < 0))
+            throw new Error('Indicator region must contain x, y, width and height');
+        if (event.tool === 'guide_clear') {
+            const shown = !!this._guide && this._root.visible;
+            this._clearGuide();
+            if (shown) {
+                this._clearTimers();
+                this._root.ease({opacity: 0, duration: 350,
+                    mode: Clutter.AnimationMode.EASE_OUT_QUAD, onComplete: () => this.hide()});
+            }
+            return;
+        }
+        if (event.tool === 'guide') {
+            this._guide = event;
+            this._guideAt = this._now() - ageMs;
+        }
+        if (this._guide && this._now() - this._guideAt >= GUIDE_LIFETIME_MS)
+            this._clearGuide();
+        const guide = this._guide;
         this._clearTimers();
         this._event = event;
         this._owner = owner;
         this._root.remove_all_transitions();
         this._root.opacity = 255;
-        if (ageMs >= 8000) {
+        if (!guide && ageMs >= 8000) {
             this.hide();
             return;
         }
+        if (event.tool === 'guide' && !(Number.isFinite(event.x) && Number.isFinite(event.y)))
+            this._point = null;
         const name = typeof event.agent === 'string' ? event.agent.slice(0, 96) : 'Agent';
-        this._pill.text = `●  ${name} is using your computer · ${event.tool}`;
+        this._pill.text = guide
+            ? `●  ${name} is guiding you · ${event.tool === 'guide' ? 'your turn' : event.tool}`
+            : `●  ${name} is using your computer · ${event.tool}`;
         this._bubble.text = Array.isArray(event.keys) && event.keys.length
             ? event.keys.join(' + ') : event.text ?? '';
-        this._bubble.visible = !!this._bubble.text && ageMs < 2200;
+        this._bubble.visible = !guide && !!this._bubble.text && ageMs < 2200;
         const colors = {claude: '#e08a67', codex: '#4c9dff', opencode: '#8bd47e',
             gemini: '#a8b4f8', antigravity: '#a8b4f8', hermes: '#caa2ff',
             pi: '#c08cf0', cursor: '#b7d1aa', goose: '#c5aa79'};
@@ -462,8 +582,24 @@ class ActivityIndicator {
         for (const edge of this._edges)
             edge.set_style(this._edgeStyle(edge._direction));
         this._layout(event, ageMs === 0);
+        if (event.tool === 'guide' && !this._point)
+            this._cursor.hide();
         this._cursor.queue_repaint();
         this._root.show();
+        if (guide) {
+            this._layoutGuide(guide);
+            if (ageMs !== 0 || event.tool !== 'guide')
+                this._guidePulse();
+            const remaining = GUIDE_LIFETIME_MS - (this._now() - this._guideAt);
+            this._later(Math.max(1, remaining), () => {
+                this._clearGuide();
+                this._root.ease({opacity: 0, duration: 350,
+                    mode: Clutter.AnimationMode.EASE_OUT_QUAD, onComplete: () => this.hide()});
+            });
+            return;
+        }
+        this._hint.hide();
+        this._highlight.hide();
         if (this._bubble.visible)
             this._later(Math.max(1, 2200 - ageMs), () => this._bubble.hide());
         this._later(8000 - ageMs, () => {
@@ -508,6 +644,7 @@ class ActivityIndicator {
             reactive: this._root.reactive, can_focus: this._root.can_focus,
             agent: this._event?.agent ?? null, tool: this._event?.tool ?? null,
             text: this._bubble.text, point: this._point,
+            guide: this._guide ? {hint: this._hint.text, highlighted: this._highlight.visible} : null,
             pointer: global.get_pointer().slice(0, 2),
             focused_pid: global.display.focus_window?.get_pid() ?? null,
             overview: Main.overview.visible,

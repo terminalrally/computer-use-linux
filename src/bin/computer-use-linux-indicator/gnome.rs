@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use computer_use_linux::indicator::{
     capture_lock_path, gnome_indicator_state, hide_gnome_indicator, show_gnome_indicator,
     socket_path, Capture, IndicatorEvent, CAPTURE_REPLY_EMPTY, CAPTURE_REPLY_SHOWN,
+    GUIDE_CLEAR_TOOL, GUIDE_LIFETIME, GUIDE_TOOL,
 };
 use std::{
     fs::{File, OpenOptions, TryLockError},
@@ -56,6 +57,9 @@ pub fn run() -> Result<()> {
         let socket = tokio::io::unix::AsyncFd::new(socket)?;
         let mut ticker = tokio::time::interval(Duration::from_millis(40));
         let mut last: Option<IndicatorEvent> = None;
+        // Guide hints outlive the 8s activity window, so they are re-shown
+        // separately after a capture until cleared or expired.
+        let mut guide: Option<(IndicatorEvent, Instant)> = None;
         let mut action_at = Instant::now();
         let mut suspended = held(&capture);
         loop {
@@ -70,9 +74,24 @@ pub fn run() -> Result<()> {
             if blocked && !suspended {
                 hide_gnome_indicator(&connection).await?;
             }
+            if guide
+                .as_ref()
+                .is_some_and(|(_, at)| at.elapsed() >= GUIDE_LIFETIME)
+            {
+                guide = None;
+            }
             if !blocked && suspended {
-                if let Some(event) = &last {
-                    if action_at.elapsed() < Duration::from_secs(8) {
+                if let Some((event, at)) = &guide {
+                    show_gnome_indicator(
+                        &connection,
+                        event,
+                        at.elapsed().as_millis().min(u32::MAX as u128) as u32,
+                    )
+                    .await?;
+                } else if let Some(event) = &last {
+                    if event.tool == GUIDE_CLEAR_TOOL
+                        || action_at.elapsed() < Duration::from_secs(8)
+                    {
                         show_gnome_indicator(
                             &connection,
                             event,
@@ -114,13 +133,18 @@ pub fn run() -> Result<()> {
                         if !blocked {
                             show_gnome_indicator(&connection, &event, 0).await?;
                         }
+                        if event.tool == GUIDE_TOOL {
+                            guide = Some((event.clone(), action_at));
+                        } else if event.tool == GUIDE_CLEAR_TOOL {
+                            guide = None;
+                        }
                         last = Some(event);
                         suspended = blocked;
                     }
                     None => {}
                 }
             }
-            if action_at.elapsed() >= Duration::from_secs(600) {
+            if guide.is_none() && action_at.elapsed() >= Duration::from_secs(600) {
                 return Ok(());
             }
         }

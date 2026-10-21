@@ -8,7 +8,9 @@
 //! - a software cursor that glides along an arc to each target and ripples on
 //!   click (moving it only changes surface margins, nothing is redrawn);
 //! - keycaps or a typing line next to the cursor for keyboard input;
-//! - a glow along every screen edge and a status pill.
+//! - a glow along every screen edge and a status pill;
+//! - in guide mode, an outline around the target, a pulsing ring under the
+//!   cursor and the instruction for the user, kept until the server clears it.
 //!
 //! Surfaces exist only while the agent is active and fade out after a few idle
 //! seconds. The process exits after ten idle minutes; the server restarts it
@@ -31,7 +33,7 @@ use std::{
 
 use computer_use_linux::indicator::{
     capture_lock_path, socket_path, Capture, IndicatorEvent, CAPTURE_REPLY_EMPTY,
-    CAPTURE_REPLY_SHOWN, GLIDE, HIDE_SETTLE,
+    CAPTURE_REPLY_SHOWN, GLIDE, GUIDE_CLEAR_TOOL, GUIDE_LIFETIME, GUIDE_TOOL, HIDE_SETTLE,
 };
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, Region},
@@ -87,6 +89,14 @@ const EDGE: u32 = 26;
 const PILL_SIZE: (u32, u32) = (560, 56);
 const PILL_TOP: i32 = 34;
 const BUBBLE_SIZE: (u32, u32) = (460, 48);
+const HINT_SIZE: (u32, u32) = (480, 176);
+const HINT_TEXT: f32 = 15.0;
+const HINT_LINES: usize = 4;
+/// Space between a guide target and its outline, and between outline and hint.
+const HIGHLIGHT_PAD: f32 = 6.0;
+/// Period of the guide pulse around the target.
+const GUIDE_PULSE: f32 = 1.6;
+const GUIDE_FRAME: Duration = Duration::from_millis(40);
 const FRAME: Duration = Duration::from_millis(16);
 const RESTING_FRAME: Duration = Duration::from_millis(250);
 /// How often to look for the end of a capture that holds the overlay back.
@@ -118,6 +128,7 @@ fn tool_label(tool: &str) -> &str {
         "move_window" => "moving window",
         "resize_window" => "resizing window",
         "screenshot" | "get_app_state" => "looking at the screen",
+        GUIDE_TOOL => "your turn",
         other => other,
     }
 }
@@ -127,6 +138,10 @@ enum Kind {
     Cursor,
     Pill,
     Bubble,
+    /// Guide mode: the instruction for the user.
+    Hint,
+    /// Guide mode: an outline around the target.
+    Highlight,
     Edge(EdgeKind),
 }
 
@@ -254,6 +269,80 @@ enum Keyboard {
     Text(String),
 }
 
+/// A guide hint on screen: what the user should do next.
+struct Guide {
+    hint: String,
+    keys: Vec<String>,
+    text: Option<String>,
+    /// Target outline in logical desktop coordinates.
+    region: Option<Rect>,
+    since: Instant,
+}
+
+impl Guide {
+    /// 0..1 phase of the pulse around the target.
+    fn phase(&self) -> f32 {
+        (self.since.elapsed().as_secs_f32() % GUIDE_PULSE) / GUIDE_PULSE
+    }
+}
+
+/// Greedy word wrap into at most `max_lines` lines no wider than `max_width`.
+/// Words wider than a line are broken; text past the last line ends in `…`.
+fn wrap_lines(
+    text: &str,
+    max_width: f32,
+    max_lines: usize,
+    measure: impl Fn(&str) -> f32,
+) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut overflow = false;
+    'words: for word in text.split_whitespace() {
+        let candidate = if current.is_empty() {
+            word.to_string()
+        } else {
+            format!("{current} {word}")
+        };
+        if measure(&candidate) <= max_width {
+            current = candidate;
+            continue;
+        }
+        if !current.is_empty() {
+            if lines.len() + 1 >= max_lines {
+                overflow = true;
+                break;
+            }
+            lines.push(std::mem::take(&mut current));
+        }
+        for c in word.chars() {
+            let mut next = current.clone();
+            next.push(c);
+            if !current.is_empty() && measure(&next) > max_width {
+                if lines.len() + 1 >= max_lines {
+                    overflow = true;
+                    break 'words;
+                }
+                lines.push(std::mem::take(&mut current));
+                current.push(c);
+            } else {
+                current = next;
+            }
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if overflow {
+        if let Some(last) = lines.last_mut() {
+            while !last.is_empty() && measure(&format!("{last}…")) > max_width {
+                last.pop();
+            }
+            *last = format!("{}…", last.trim_end());
+        }
+    }
+    lines
+}
+
 struct App {
     registry: RegistryState,
     outputs: OutputState,
@@ -275,6 +364,9 @@ struct App {
     glide: Option<Glide>,
     pulse: Option<(Instant, (f32, f32))>,
     keyboard: Option<(Instant, Keyboard)>,
+    guide: Option<Guide>,
+    /// Requested size of the highlight panel, which follows the target.
+    highlight_size: Option<(u32, u32)>,
     last_action: Instant,
     shown_at: Instant,
     fading: Option<Instant>,
@@ -419,17 +511,53 @@ impl App {
     }
 
     fn on_event(&mut self, event: IndicatorEvent, qh: &QueueHandle<Self>) {
+        if event.tool == GUIDE_CLEAR_TOOL {
+            if self.guide.take().is_some() && self.visible() {
+                self.fading = Some(Instant::now());
+                self.ensure_animation();
+            }
+            return;
+        }
         self.agent = event.agent;
         self.tool = event.tool;
         self.last_action = Instant::now();
         self.fading = None;
-        self.keyboard = if !event.keys.is_empty() {
-            Some((Instant::now(), Keyboard::Keys(event.keys)))
+        if self.tool == GUIDE_TOOL {
+            let region = event.region.map(|(x, y, w, h)| {
+                let w = i32::try_from(w).unwrap_or(i32::MAX);
+                let h = i32::try_from(h).unwrap_or(i32::MAX);
+                let start = self.logical_point((x, y), event.space);
+                let end =
+                    self.logical_point((x.saturating_add(w), y.saturating_add(h)), event.space);
+                Rect {
+                    x: start.0,
+                    y: start.1,
+                    w: (end.0 - start.0).max(0.0),
+                    h: (end.1 - start.1).max(0.0),
+                }
+            });
+            self.guide = Some(Guide {
+                hint: event.hint.unwrap_or_default(),
+                keys: event.keys,
+                text: event.text,
+                region,
+                since: Instant::now(),
+            });
+            self.keyboard = None;
+            if event.x.is_none() || event.y.is_none() {
+                // Nothing to point at: do not leave the cursor on a stale target.
+                self.glide = None;
+                self.cursor = None;
+            }
         } else {
-            event
-                .text
-                .map(|text| (Instant::now(), Keyboard::Text(text)))
-        };
+            self.keyboard = if !event.keys.is_empty() {
+                Some((Instant::now(), Keyboard::Keys(event.keys)))
+            } else {
+                event
+                    .text
+                    .map(|text| (Instant::now(), Keyboard::Text(text)))
+            };
+        }
         if let (Some(x), Some(y)) = (event.x, event.y) {
             let to = self.logical_point((x, y), event.space);
             // First appearance glides in from a short distance away.
@@ -482,6 +610,7 @@ impl App {
         }
         self.pulse = None;
         self.keyboard = None;
+        self.guide = None;
         self.fading = None;
         self.active = false;
         if !self.panels.is_empty() {
@@ -619,6 +748,7 @@ impl App {
             self.place(qh, Kind::Pill, PILL_SIZE, top_left, top_left);
         }
 
+        let pill_rect = pill_output.as_ref().map(|(_, rect)| *rect);
         match (&self.keyboard, cursor, pill_output) {
             // Keystrokes go to the focused field, usually where the cursor last clicked.
             (Some(_), Some((x, y)), _) => {
@@ -631,6 +761,96 @@ impl App {
             }
             _ => self.panels.retain(|panel| panel.kind != Kind::Bubble),
         }
+        self.sync_guide_panels(qh, cursor, pill_rect);
+    }
+
+    /// Places the target outline and the instruction of a guide hint.
+    fn sync_guide_panels(
+        &mut self,
+        qh: &QueueHandle<Self>,
+        cursor: Option<(f32, f32)>,
+        pill_output: Option<Rect>,
+    ) {
+        let region = self
+            .guide
+            .as_ref()
+            .and_then(|guide| guide.region)
+            .filter(|region| region.w >= 1.0 && region.h >= 1.0);
+        let highlight = region.and_then(|region| {
+            let center = (region.x + region.w / 2.0, region.y + region.h / 2.0);
+            let (_, output) = self.output_for(center)?;
+            let size = (
+                (region.w + 2.0 * HIGHLIGHT_PAD)
+                    .min(output.w)
+                    .round()
+                    .max(1.0) as u32,
+                (region.h + 2.0 * HIGHLIGHT_PAD)
+                    .min(output.h)
+                    .round()
+                    .max(1.0) as u32,
+            );
+            Some((region, center, size))
+        });
+        match highlight {
+            Some((region, center, size)) => {
+                // Layer surfaces keep their size; a new size needs a new panel.
+                if self.highlight_size != Some(size) {
+                    self.panels.retain(|panel| panel.kind != Kind::Highlight);
+                    self.highlight_size = Some(size);
+                }
+                let top_left = (region.x - HIGHLIGHT_PAD, region.y - HIGHLIGHT_PAD);
+                self.place(qh, Kind::Highlight, size, top_left, center);
+            }
+            None => {
+                self.panels.retain(|panel| panel.kind != Kind::Highlight);
+                self.highlight_size = None;
+            }
+        }
+
+        if self.guide.is_none() {
+            self.panels.retain(|panel| panel.kind != Kind::Hint);
+            return;
+        }
+        let (hint_w, hint_h) = (HINT_SIZE.0 as f32, HINT_SIZE.1 as f32);
+        // Below the target, or above it when the screen ends first.
+        let below = |top: f32, bottom: f32, x: f32, on: (f32, f32), app: &Self| {
+            let fits = app
+                .output_for(on)
+                .is_none_or(|(_, output)| bottom + hint_h <= output.y + output.h);
+            if fits {
+                (x, bottom)
+            } else {
+                (x, top - hint_h)
+            }
+        };
+        let (top_left, on) = match (region, cursor) {
+            (Some(region), _) => {
+                let on = (region.x + region.w / 2.0, region.y + region.h / 2.0);
+                let gap = HIGHLIGHT_PAD + 8.0;
+                (
+                    below(
+                        region.y - gap,
+                        region.y + region.h + gap,
+                        region.x,
+                        on,
+                        self,
+                    ),
+                    on,
+                )
+            }
+            (None, Some((x, y))) => (below(y - 12.0, y + 34.0, x + 20.0, (x, y), self), (x, y)),
+            (None, None) => match pill_output {
+                Some(output) => {
+                    let top_left = (
+                        output.x + (output.w - hint_w) / 2.0,
+                        output.y + (PILL_TOP + PILL_SIZE.1 as i32) as f32,
+                    );
+                    (top_left, top_left)
+                }
+                None => return,
+            },
+        };
+        self.place(qh, Kind::Hint, HINT_SIZE, top_left, on);
     }
 
     fn tick(&mut self, qh: &QueueHandle<Self>) {
@@ -656,12 +876,22 @@ impl App {
         {
             self.keyboard = None;
         }
+        if self
+            .guide
+            .as_ref()
+            .is_some_and(|guide| guide.since.elapsed() > GUIDE_LIFETIME)
+        {
+            self.guide = None;
+        }
         match self.fading {
             Some(at) if at.elapsed().as_secs_f32() > FADE_OUT => {
                 self.hide();
                 return;
             }
-            None if self.visible() && self.last_action.elapsed() > IDLE_BEFORE_FADE => {
+            None if self.visible()
+                && self.guide.is_none()
+                && self.last_action.elapsed() > IDLE_BEFORE_FADE =>
+            {
                 self.fading = Some(Instant::now());
             }
             _ => {}
@@ -684,7 +914,13 @@ impl App {
                     app.animating = false;
                     return TimeoutAction::Drop;
                 }
-                TimeoutAction::ToDuration(if app.busy() { FRAME } else { RESTING_FRAME })
+                TimeoutAction::ToDuration(if app.busy() {
+                    FRAME
+                } else if app.guide.is_some() {
+                    GUIDE_FRAME
+                } else {
+                    RESTING_FRAME
+                })
             });
         if started.is_err() {
             self.animating = false;
@@ -772,6 +1008,12 @@ impl App {
             let age = at.elapsed().as_secs_f32();
             (age / 0.12).min(1.0) * ((KEYS_SHOWN - age) / 0.3).clamp(0.0, 1.0)
         });
+        // The guide pulse waits until the cursor has landed.
+        let guide_phase = self
+            .guide
+            .as_ref()
+            .filter(|_| self.glide.is_none())
+            .map(Guide::phase);
 
         match kind {
             Kind::Cursor => {
@@ -780,10 +1022,21 @@ impl App {
                 ((tip.0 * 4.0) as i32, (tip.1 * 4.0) as i32).hash(&mut signature);
                 ((sway * 10.0) as i32, pressed).hash(&mut signature);
                 pulse.map(|(t, _)| (t * 60.0) as u32).hash(&mut signature);
+                guide_phase.map(|t| (t * 40.0) as u32).hash(&mut signature);
             }
             Kind::Pill => {
                 (self.tool.as_str(), (breath * 20.0) as u32).hash(&mut signature);
+                self.guide.is_some().hash(&mut signature);
                 self.fonts.get().is_some().hash(&mut signature);
+            }
+            Kind::Hint => {
+                self.fonts.get().is_some().hash(&mut signature);
+                if let Some(guide) = &self.guide {
+                    (&guide.hint, &guide.keys, &guide.text).hash(&mut signature);
+                }
+            }
+            Kind::Highlight => {
+                guide_phase.map(|t| (t * 40.0) as u32).hash(&mut signature);
             }
             Kind::Bubble => {
                 ((keyboard_alpha * 50.0) as u32, blink).hash(&mut signature);
@@ -821,6 +1074,17 @@ impl App {
                         draw::with_alpha(color, 0.9 * (1.0 - t) * alpha),
                     );
                 }
+                if let (Some(t), Some(point)) = (guide_phase, cursor) {
+                    let center = (point.0 - panel_origin.0, point.1 - panel_origin.1);
+                    draw::ring(
+                        &mut pixmap,
+                        scale,
+                        center,
+                        12.0 + 30.0 * t,
+                        3.0,
+                        draw::with_alpha(color, 0.85 * (1.0 - t) * alpha),
+                    );
+                }
                 if let Some(point) = cursor {
                     let tip = (point.0 - panel_origin.0, point.1 - panel_origin.1);
                     let factor = if pressed { 0.88 } else { 1.0 };
@@ -834,6 +1098,26 @@ impl App {
             Kind::Pill => self.draw_pill(&mut pixmap, scale, size, color, alpha, breath),
             Kind::Bubble => {
                 self.draw_bubble(&mut pixmap, scale, color, alpha * keyboard_alpha, blink)
+            }
+            Kind::Hint => self.draw_hint(&mut pixmap, scale, size, color, alpha),
+            Kind::Highlight => {
+                let glow = 0.55 + 0.45 * (1.0 - guide_phase.unwrap_or(0.0) * 2.0).abs();
+                let (w, h) = (size.0 as f32, size.1 as f32);
+                draw::fill_rounded(
+                    &mut pixmap,
+                    scale,
+                    (1.5, 1.5, w - 3.0, h - 3.0),
+                    8.0,
+                    draw::with_alpha(color, 0.10 * alpha),
+                );
+                draw::stroke_rounded(
+                    &mut pixmap,
+                    scale,
+                    (1.5, 1.5, w - 3.0, h - 3.0),
+                    8.0,
+                    3.0,
+                    draw::with_alpha(color, glow * alpha),
+                );
             }
         }
 
@@ -871,7 +1155,11 @@ impl App {
         let Some(fonts) = self.fonts.get() else {
             return;
         };
-        let title = format!("{} is using your computer", self.agent);
+        let title = if self.guide.is_some() {
+            format!("{} is guiding you", self.agent)
+        } else {
+            format!("{} is using your computer", self.agent)
+        };
         let label = tool_label(&self.tool);
         let text_size = 14.0;
         let title_w = font::measure(&fonts.semibold, text_size, &title);
@@ -1031,6 +1319,114 @@ impl App {
                     );
                 }
             }
+        }
+    }
+
+    /// The instruction card: wrapped instruction, then the keys to press and
+    /// the text to type.
+    fn draw_hint(
+        &self,
+        pixmap: &mut Pixmap,
+        scale: f32,
+        size: (u32, u32),
+        color: Color,
+        alpha: f32,
+    ) {
+        let (Some(fonts), Some(guide)) = (self.fonts.get(), &self.guide) else {
+            return;
+        };
+        let (x, y, pad, accent, gap) = (4.0, 4.0, 14.0, 4.0, 6.0);
+        let max_w = size.0 as f32 - 2.0 * x - 2.0 * pad - accent;
+        let (ascent, line) = font::line_metrics(&fonts.semibold, HINT_TEXT);
+        let mut lines = wrap_lines(&guide.hint, max_w, HINT_LINES, |text| {
+            font::measure(&fonts.semibold, HINT_TEXT, text)
+        });
+        if lines.is_empty() {
+            lines.push("Follow the pointer".to_string());
+        }
+        let mut extras: Vec<(&str, String)> = Vec::new();
+        if !guide.keys.is_empty() {
+            extras.push(("Press", guide.keys.join(" + ")));
+        }
+        if let Some(text) = guide.text.as_deref().filter(|text| !text.is_empty()) {
+            extras.push(("Type", text.to_string()));
+        }
+        let label_w = extras
+            .iter()
+            .map(|(label, _)| font::measure(&fonts.semibold, 13.0, label))
+            .fold(0.0, f32::max);
+        let extras: Vec<(&str, String)> = extras
+            .into_iter()
+            .map(|(label, value)| {
+                let value = wrap_lines(&value, max_w - label_w - 10.0, 1, |text| {
+                    font::measure(&fonts.regular, 13.0, text)
+                })
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+                (label, value)
+            })
+            .collect();
+        let text_w = lines
+            .iter()
+            .map(|text| font::measure(&fonts.semibold, HINT_TEXT, text))
+            .chain(
+                extras
+                    .iter()
+                    .map(|(_, value)| label_w + 10.0 + font::measure(&fonts.regular, 13.0, value)),
+            )
+            .fold(0.0, f32::max);
+        let w = (text_w + 2.0 * pad + accent).min(size.0 as f32 - 2.0 * x);
+        let h = (2.0 * pad + lines.len() as f32 * line + extras.len() as f32 * (line + gap))
+            .min(size.1 as f32 - 2.0 * y);
+        draw::panel(
+            pixmap,
+            scale,
+            (x, y, w, h),
+            12.0,
+            Color::from_rgba(0.09, 0.09, 0.11, 0.92 * alpha).unwrap_or(Color::BLACK),
+            draw::with_alpha(color, 0.75 * alpha),
+            0.35 * alpha,
+        );
+        draw::fill_rounded(
+            pixmap,
+            scale,
+            (x + 6.0, y + 10.0, accent, h - 20.0),
+            2.0,
+            draw::with_alpha(color, alpha),
+        );
+        let text_x = x + pad + accent;
+        let mut baseline = y + pad + ascent;
+        for text in &lines {
+            font::draw(
+                pixmap,
+                &fonts.semibold,
+                HINT_TEXT * scale,
+                (text_x * scale, baseline * scale),
+                text,
+                white(0.97 * alpha),
+            );
+            baseline += line;
+        }
+        for (label, value) in &extras {
+            baseline += gap;
+            font::draw(
+                pixmap,
+                &fonts.semibold,
+                13.0 * scale,
+                (text_x * scale, baseline * scale),
+                label,
+                draw::with_alpha(color, alpha),
+            );
+            font::draw(
+                pixmap,
+                &fonts.regular,
+                13.0 * scale,
+                ((text_x + label_w + 10.0) * scale, baseline * scale),
+                value,
+                white(0.9 * alpha),
+            );
+            baseline += line;
         }
     }
 
@@ -1359,6 +1755,8 @@ fn run_layer_shell() -> Result<(), String> {
         glide: None,
         pulse: None,
         keyboard: None,
+        guide: None,
+        highlight_size: None,
         last_action: Instant::now(),
         shown_at: Instant::now(),
         fading: None,
@@ -1503,6 +1901,24 @@ mod tests {
         let third = open();
         third.try_lock_shared().unwrap();
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn hints_wrap_by_width_and_end_in_an_ellipsis() {
+        let width = |text: &str| text.chars().count() as f32;
+        assert_eq!(
+            wrap_lines("Open File then Import", 10.0, 4, width),
+            vec!["Open File", "then", "Import"]
+        );
+        assert_eq!(
+            wrap_lines("abcdefghijkl", 5.0, 4, width),
+            vec!["abcde", "fghij", "kl"]
+        );
+        let cut = wrap_lines("one two three four five six", 7.0, 2, width);
+        assert_eq!(cut.len(), 2);
+        assert!(cut[1].ends_with('…'), "{cut:?}");
+        assert!(cut.iter().all(|line| width(line) <= 7.0), "{cut:?}");
+        assert!(wrap_lines("   ", 10.0, 3, width).is_empty());
     }
 
     #[test]
