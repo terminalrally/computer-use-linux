@@ -16,6 +16,11 @@
 //! at once; it answers `begin` with [`CAPTURE_REPLY_SHOWN`] or
 //! [`CAPTURE_REPLY_EMPTY`], so a capture waits for the compositor only when
 //! something was on screen.
+//!
+//! In guide mode the server does not act on the desktop. It sends
+//! [`GUIDE_TOOL`] events instead: the overlay points at the place the user
+//! should act on, outlines it, and shows the instruction until the server
+//! sends [`GUIDE_CLEAR_TOOL`] or [`GUIDE_LIFETIME`] passes.
 
 use std::{
     env,
@@ -58,6 +63,16 @@ pub const HIDE_SETTLE: Duration = Duration::from_millis(120);
 const CAPTURE_REPLY_WAIT: Duration = Duration::from_millis(100);
 const SPAWN_WAIT: Duration = Duration::from_secs(1);
 const TEXT_LIMIT: usize = 64;
+/// Longest guide instruction sent to the overlay, in characters. Keeps every
+/// event well inside the overlay's datagram buffer.
+pub const HINT_LIMIT: usize = 280;
+
+/// Tool name of a guide-mode hint event.
+pub const GUIDE_TOOL: &str = "guide";
+/// Tool name of the event that removes the current guide hint.
+pub const GUIDE_CLEAR_TOOL: &str = "guide_clear";
+/// How long a guide hint stays on screen without being replaced or cleared.
+pub const GUIDE_LIFETIME: Duration = Duration::from_secs(600);
 
 /// A server starting or finishing a screen capture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,9 +107,88 @@ pub struct IndicatorEvent {
     /// Key chord parts for `press_key`, e.g. `["ctrl", "l"]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keys: Vec<String>,
-    /// Typed text (tail only, possibly masked).
+    /// Typed text (tail only, possibly masked). For guide events: the text
+    /// the user is asked to type.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// Guide-mode instruction for the user, shown until cleared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    /// Guide-mode target outline `(x, y, width, height)`, in the same space
+    /// as `x`/`y`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<(i32, i32, u32, u32)>,
+}
+
+/// What a guide hint asks the user to do, and where.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct GuideHint {
+    /// The instruction, e.g. `Open File > Import File…`.
+    pub instruction: String,
+    /// Point to show the pointer at, in screenshot pixels.
+    pub point: Option<(i32, i32)>,
+    /// Outline around the target, in screenshot pixels.
+    pub region: Option<(i32, i32, u32, u32)>,
+    /// Key chord the user should press, e.g. `Ctrl+Shift+E`.
+    pub keys: Option<String>,
+    /// Text the user should type.
+    pub text: Option<String>,
+}
+
+/// First `limit` characters, with an ellipsis when something was cut.
+fn head_text(text: &str, limit: usize) -> String {
+    let text = text.trim();
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let mut head: String = text.chars().take(limit.saturating_sub(1)).collect();
+    head.push('…');
+    head
+}
+
+/// The overlay event for a guide hint. Points and outlines need the capture
+/// size to be placed; without it only the instruction is shown.
+pub(crate) fn guide_event(
+    agent: String,
+    hint: &GuideHint,
+    space: Option<(u32, u32)>,
+    mask_text: bool,
+) -> IndicatorEvent {
+    let placed = space.is_some();
+    IndicatorEvent {
+        agent,
+        tool: GUIDE_TOOL.to_string(),
+        x: hint.point.filter(|_| placed).map(|(x, _)| x),
+        y: hint.point.filter(|_| placed).map(|(_, y)| y),
+        space: space.filter(|_| hint.point.is_some() || hint.region.is_some()),
+        keys: hint
+            .keys
+            .as_deref()
+            .map(|chord| {
+                chord
+                    .split('+')
+                    .map(str::trim)
+                    .filter(|key| !key.is_empty())
+                    .map(|key| head_text(key, 24))
+                    .take(6)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        text: hint
+            .text
+            .as_deref()
+            .filter(|text| !text.is_empty())
+            .map(|text| {
+                if mask_text {
+                    shown_text(text, true)
+                } else {
+                    head_text(text, TEXT_LIMIT)
+                }
+            }),
+        hint: Some(head_text(&hint.instruction, HINT_LIMIT)),
+        region: hint.region.filter(|_| placed),
+        ..IndicatorEvent::default()
+    }
 }
 
 /// Path of the overlay socket, or `None` without `XDG_RUNTIME_DIR`.
@@ -394,6 +488,19 @@ impl Indicator {
             ..self.event(tool)
         };
         self.send(&event).await;
+    }
+
+    /// Shows a guide hint until it is replaced or cleared. Returns whether the
+    /// overlay received it; when it did not, the user only sees the hint
+    /// through the agent's own reply.
+    pub(crate) async fn guide(&self, hint: &GuideHint, space: Option<(u32, u32)>) -> bool {
+        let event = guide_event(self.agent(), hint, space, self.mask_text);
+        self.send(&event).await
+    }
+
+    /// Removes the current guide hint.
+    pub(crate) async fn clear_guide(&self) -> bool {
+        self.send(&self.event(GUIDE_CLEAR_TOOL)).await
     }
 
     /// Keeps every overlay off the screen until the returned hold drops, and
@@ -1068,5 +1175,57 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(begin.unwrap(), r#"{"capture":"begin"}"#);
+    }
+
+    #[test]
+    fn guide_events_carry_the_hint_target_and_input() {
+        let hint = GuideHint {
+            instruction: "Open File > Import File…".into(),
+            point: Some((100, 200)),
+            region: Some((80, 190, 40, 20)),
+            keys: Some("Ctrl + I".into()),
+            text: Some("crackme".into()),
+        };
+        let event = guide_event("Claude".into(), &hint, Some((1920, 1080)), false);
+        assert_eq!(event.tool, GUIDE_TOOL);
+        assert_eq!((event.x, event.y), (Some(100), Some(200)));
+        assert_eq!(event.space, Some((1920, 1080)));
+        assert_eq!(event.region, Some((80, 190, 40, 20)));
+        assert_eq!(event.keys, vec!["Ctrl", "I"]);
+        assert_eq!(event.text.as_deref(), Some("crackme"));
+        assert_eq!(event.hint.as_deref(), Some("Open File > Import File…"));
+        let json = serde_json::to_vec(&event).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<IndicatorEvent>(&json).unwrap(),
+            event
+        );
+    }
+
+    #[test]
+    fn unplaceable_guide_events_keep_only_the_instruction() {
+        let hint = GuideHint {
+            instruction: "x".repeat(HINT_LIMIT * 2),
+            point: Some((1, 2)),
+            region: Some((0, 0, 4, 4)),
+            text: Some("hunter2".into()),
+            ..GuideHint::default()
+        };
+        let event = guide_event("Agent".into(), &hint, None, true);
+        assert_eq!(
+            (event.x, event.y, event.space, event.region),
+            (None, None, None, None)
+        );
+        assert_eq!(event.hint.unwrap().chars().count(), HINT_LIMIT);
+        assert_eq!(event.text.as_deref(), Some(shown_text("", true).as_str()));
+        // The largest possible guide event fits the overlay's 4 KiB buffer.
+        let widest = GuideHint {
+            instruction: "\u{1F600}".repeat(HINT_LIMIT * 2),
+            point: Some((i32::MIN, i32::MIN)),
+            region: Some((i32::MIN, i32::MIN, u32::MAX, u32::MAX)),
+            keys: Some(vec!["\u{1F600}".repeat(40); 8].join("+")),
+            text: Some("\u{1F600}".repeat(200)),
+        };
+        let event = guide_event("A".repeat(96), &widest, Some((u32::MAX, u32::MAX)), false);
+        assert!(serde_json::to_vec(&event).unwrap().len() < 4096);
     }
 }

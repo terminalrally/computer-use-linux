@@ -7,6 +7,8 @@ use crate::atspi_tree::{
 };
 use crate::diagnostics::{doctor_report, setup_accessibility_report, DoctorReport, SetupReport};
 use crate::gnome_extension::{setup_window_targeting_report, WindowTargetingSetupReport};
+use crate::guide::{DesktopFingerprint, ElementMark, ServerMode, TreeMark, WindowMark};
+use crate::indicator::GuideHint;
 use crate::remote_desktop::{
     click as portal_click, drag as portal_drag, keysyms_for_text, press_key_chord,
     press_keycode_chord, scroll as portal_scroll, start_portal_keyboard_session,
@@ -65,6 +67,14 @@ const KDE_KLIPPER_PATH: &str = "/klipper";
 const KDE_KLIPPER_INTERFACE: &str = "org.kde.klipper.klipper";
 const SHELL_ENABLE_ENV: &str = "COMPUTER_USE_LINUX_ENABLE_SHELL";
 const COMPLETION_ENABLE_ENV: &str = "COMPUTER_USE_LINUX_NOTIFY_ON_COMPLETE";
+const WAIT_FOR_USER_DEFAULT_SECS: u64 = 60;
+const WAIT_FOR_USER_MAX_SECS: u64 = 300;
+const WAIT_FOR_USER_DEFAULT_SETTLE_MS: u64 = 1500;
+const WAIT_FOR_USER_MAX_SETTLE_MS: u64 = 10_000;
+const WAIT_FOR_USER_POLL: Duration = Duration::from_millis(700);
+/// Bounds for the tree `wait_for_user` digests on every poll.
+const WAIT_FOR_USER_TREE_NODES: usize = 800;
+const WAIT_FOR_USER_TREE_DEPTH: u32 = 32;
 const SHELL_DEFAULT_TIMEOUT_SECS: u64 = 30;
 const SHELL_MAX_TIMEOUT_SECS: u64 = 120;
 const SHELL_MAX_COMMAND_BYTES: usize = 64 * 1024;
@@ -95,6 +105,8 @@ pub struct ComputerUseLinux {
     desktop_size: Arc<Mutex<Option<(u32, u32)>>>,
     /// On-screen activity overlay (opt-out via `COMPUTER_USE_LINUX_INDICATOR=0`).
     indicator: Arc<crate::indicator::Indicator>,
+    /// Whether the agent drives the desktop or guides the user through it.
+    mode: ServerMode,
 }
 
 fn sanitize_unsigned_integer_formats(value: &mut serde_json::Value) {
@@ -138,6 +150,9 @@ impl ComputerUseLinux {
         }
         if !shell_execution_enabled() {
             router.map.remove("run_shell");
+        }
+        for name in self.mode.removed_tools() {
+            router.map.remove(*name);
         }
         for route in router.map.values_mut() {
             let input_schema = Arc::make_mut(&mut route.attr.input_schema);
@@ -2147,19 +2162,268 @@ impl ComputerUseLinux {
         self.finish_window_geometry_output(output, &capture, &target)
             .await
     }
+
+    #[tool(
+        name = "show_guidance",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<ShowGuidanceOutput>(),
+        description = "Guide mode: show the user what to do next without doing it. Draws an on-screen pointer and outline at the target with the instruction (plus keycaps for keys and the text for text_to_type) until the next show_guidance, clear_guidance, or a change seen by wait_for_user. Target an element with element_index or a role/name/text/states selector from the latest get_app_state, or desktop coordinate pixels with x/y (relative=true plus a window target for window-crop pixels); omit every target to show only the instruction. Never sends input. The overlay is excluded from screenshots. When overlay_shown=false, describe the location to the user in words.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn show_guidance(
+        &self,
+        Parameters(params): Parameters<ShowGuidanceParams>,
+    ) -> Json<ShowGuidanceOutput> {
+        let instruction = params.instruction.trim().to_string();
+        if instruction.is_empty() {
+            return Json(ShowGuidanceOutput::failed(
+                instruction,
+                "Pass a short instruction for the user, e.g. \"Click File, then Import File…\".",
+            ));
+        }
+        let target = match self.resolve_guidance_target(&params).await {
+            Ok(target) => target,
+            Err(message) => return Json(ShowGuidanceOutput::failed(instruction, &message)),
+        };
+        let space = self.indicator_space();
+        let mut notes = Vec::new();
+        if let (Some((x, y)), Some((width, height))) = (target.point, space) {
+            if x < 0 || y < 0 || x as u32 >= width || y as u32 >= height {
+                notes.push(format!(
+                    "WARNING: the target {x},{y} is outside the captured desktop ({width}x{height}); the user cannot see it. Guide them to bring it on screen first."
+                ));
+            }
+        }
+        if target.point.is_some() && space.is_none() {
+            notes.push(
+                "The overlay cannot place a pointer before the first full-desktop capture; call get_app_state or screenshot first. The instruction is shown without a pointer."
+                    .to_string(),
+            );
+        }
+        let hint = GuideHint {
+            instruction: instruction.clone(),
+            point: target.point,
+            region: target.region,
+            keys: params
+                .keys
+                .as_deref()
+                .map(str::trim)
+                .filter(|keys| !keys.is_empty())
+                .map(str::to_string),
+            text: params.text_to_type.clone().filter(|text| !text.is_empty()),
+        };
+        let overlay_shown = self.indicator.guide(&hint, space).await;
+        if !overlay_shown {
+            notes.push(
+                "The on-screen overlay is unavailable (disabled, X11 without a compositor overlay, or GNOME without the window-targeting extension); describe the location to the user in words."
+                    .to_string(),
+            );
+        }
+        let mut message = match (&target.element, target.point) {
+            (Some(element), _) => format!(
+                "Pointing the user at element_index {} ({}{}).",
+                element.element_index,
+                element.role,
+                element
+                    .name
+                    .as_deref()
+                    .filter(|name| !name.is_empty())
+                    .map(|name| format!(" '{name}'"))
+                    .unwrap_or_default()
+            ),
+            (None, Some((x, y))) => format!("Pointing the user at {x},{y}."),
+            (None, None) => "Showing the instruction without a target.".to_string(),
+        };
+        message.push_str(" No input was sent; call wait_for_user to let the user act.");
+        for note in notes {
+            message.push(' ');
+            message.push_str(&note);
+        }
+        Json(ShowGuidanceOutput {
+            ok: true,
+            overlay_shown,
+            instruction,
+            point: target.point.map(|(x, y)| GuidancePoint { x, y }),
+            region: target.region.map(|(x, y, width, height)| Bounds {
+                x,
+                y,
+                width: width.min(i32::MAX as u32) as i32,
+                height: height.min(i32::MAX as u32) as i32,
+            }),
+            element: target.element,
+            message,
+        })
+    }
+
+    #[tool(
+        name = "clear_guidance",
+        description = "Guide mode: remove the on-screen hint shown by show_guidance.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn clear_guidance(&self) -> Json<ClearGuidanceOutput> {
+        let overlay_cleared = self.indicator.clear_guide().await;
+        Json(ClearGuidanceOutput {
+            ok: true,
+            overlay_cleared,
+        })
+    }
+
+    #[tool(
+        name = "wait_for_user",
+        output_schema = rmcp::handler::server::tool::schema_for_output::<WaitForUserToolOutput>(),
+        description = "Guide mode: wait while the user performs the step, then report what changed. Watches the focused window, the focused accessible element, and the accessibility tree of the watched app (app_name_or_bundle_identifier or pid; defaults to the app focused when the wait starts). Returns once a change has settled for settle_ms or after timeout_secs. Pass screenshot_after (true, \"screen\", or \"window\") or include_tree=true to check the result in the same call. Does not read pointer or keyboard events, so pure pointer moves and changes in apps without accessibility support only show up in the screenshot.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn wait_for_user(
+        &self,
+        Parameters(params): Parameters<WaitForUserParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let timeout_after = Duration::from_secs(
+            params
+                .timeout_secs
+                .unwrap_or(WAIT_FOR_USER_DEFAULT_SECS)
+                .clamp(1, WAIT_FOR_USER_MAX_SECS),
+        );
+        let settle = Duration::from_millis(
+            params
+                .settle_ms
+                .unwrap_or(WAIT_FOR_USER_DEFAULT_SETTLE_MS)
+                .min(WAIT_FOR_USER_MAX_SETTLE_MS),
+        );
+        let started = std::time::Instant::now();
+        let deadline = started + timeout_after;
+        let app_filter =
+            trimmed_nonempty(params.app_name_or_bundle_identifier.as_deref()).map(str::to_string);
+        let initial_window = focused_window().await.ok().flatten();
+        let watch_pid = params
+            .pid
+            .or_else(|| app_filter.is_none().then(|| initial_window.as_ref()?.pid)?);
+        let watch = GuideWatch {
+            app_filter,
+            pid: watch_pid,
+        };
+        let mut before = self.desktop_fingerprint(&watch, initial_window).await;
+        let mut latest = before.clone();
+        let mut changed_at = None;
+        let timed_out = loop {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break true;
+            }
+            sleep(WAIT_FOR_USER_POLL.min(deadline - now)).await;
+            let current = self
+                .desktop_fingerprint(&watch, focused_window().await.ok().flatten())
+                .await;
+            if current.changes_since(&latest).is_empty() {
+                // A read that failed earlier becomes the baseline once it works.
+                latest.fill_missing(&current);
+                if changed_at.is_none() {
+                    before.fill_missing(&current);
+                }
+                if changed_at.is_some_and(|at: std::time::Instant| at.elapsed() >= settle) {
+                    break false;
+                }
+                continue;
+            }
+            // Keep waiting while the user is still typing or clicking through.
+            latest = current;
+            if !latest.changes_since(&before).is_empty() {
+                changed_at = Some(std::time::Instant::now());
+            } else {
+                changed_at = None;
+            }
+        };
+        let changes = latest.changes_since(&before);
+        let changed = !changes.is_empty();
+        let guidance_cleared =
+            changed && params.clear_guidance.unwrap_or(true) && self.indicator.clear_guide().await;
+        let focused = focused_window().await.ok().flatten();
+        let focused_element = match timeout(
+            Duration::from_millis(1500),
+            probe_focused_element(focused.as_ref().and_then(|window| window.pid)),
+        )
+        .await
+        {
+            Ok(Ok(FocusProbe::Found(summary))) => Some(summary),
+            _ => None,
+        };
+        let (observation, screenshot, notes) = self
+            .capture_post_action_observation(&params.capture, None, focused.as_ref())
+            .await;
+        let mut message = if changed {
+            format!("The user changed the desktop: {}", changes.join(" "))
+        } else if timed_out {
+            format!(
+                "No change seen in {} s. The user may still be working, may need more help, or acted somewhere this tool cannot observe; check a screenshot or ask.",
+                timeout_after.as_secs()
+            )
+        } else {
+            "No change seen.".to_string()
+        };
+        if watch.pid.is_none() && watch.app_filter.is_none() {
+            message.push_str(" No app was watched, so only window and focus changes count.");
+        }
+        for note in notes {
+            message.push(' ');
+            message.push_str(&note);
+        }
+        structured_tool_result(
+            WaitForUserToolOutput {
+                output: WaitForUserOutput {
+                    changed,
+                    timed_out: !changed && timed_out,
+                    waited_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                    changes,
+                    focused_window: focused,
+                    focused_element,
+                    guidance_cleared,
+                    message,
+                },
+                observation,
+            },
+            screenshot,
+        )
+    }
 }
 
-#[tool_handler(
-    router = self.mcp_tool_router(),
-    name = "computer-use-linux",
-    // NOTE: keep in lockstep with Cargo.toml + package.json on every release.
-    // The rmcp tool_handler macro only accepts a string literal here, so this
-    // can't be env!("CARGO_PKG_VERSION"); the MCP safety check (CI) fails the
-    // build if it drifts from the Cargo version.
-    version = "0.7.22",
-    instructions = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available, and send literal type_text through KDE clipboard integration on Plasma Wayland, wtype on compatible Wayland compositors, or portal keysyms on other Wayland sessions. Portal text startup or conversion failures return an error without replaying through ydotool. GNOME preflights the complete text against every configured keyboard layout group because the background reader cannot establish the active group; rejected text can use set_value on an editable field. Raw ydotool text is limited to printable ASCII, tab and newline, uses US physical key positions, and requires checking the resulting field contents under the active layout. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Mutating tools (click, type_text, press_key, scroll, drag, perform_action, set_value, activate_window, move_window, resize_window) accept optional screenshot_after (true, \"screen\", or \"window\") with format/quality/scale/max_width/max_height/max_bytes and optional include_tree=true to return post-action observation in the same tool call. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when a concrete non-terminal focus is not editable. Exact window focus alone does not suppress a missing-focus warning; only a complete scoped tree containing window/menu chrome without content makes it informational. Terminals accept keyboard input without an EditableText interface. On Hyprland, wtype uses a single literal argument after -- to avoid stdin keymap-refresh corruption; text is visible in process arguments, so confirmed password fields are rejected (use set_value). Terminals and ambiguous fields, with or without AT-SPI, use private stdin for at most 100 Unicode characters per call; split larger input into smaller calls or expose accessibility. Input classification has its own 1500 ms budget, independent of the 250 ms cosmetic indicator timeout. Other compatible compositors retain stdin. The wtype path rejects NUL and more than 131071 UTF-8 bytes before focus or indicators. X11 xdotool can silently substitute symbols under non-US XKB layouts (reported with br/ABNT2) or changing keymap state; inspect the text before pressing Enter or submitting it. A successful type_text result confirms dispatch only; every text backend leaves field contents unverified. Re-observe the target before retrying. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Scope get_app_state with app_name_or_bundle_identifier or a window target (window_id, pid, app_id, wm_class, title); without one it returns the whole desktop AT-SPI tree, reports tree_scoped=false, and warns in message, which can flood context. accessibility_tree_truncated=true means the node, depth, or read budget stopped traversal with unread elements left; recover by scoping to a narrower app or window target and raising max_nodes or max_depth (hard caps 2000 and 64), not by lowering max_nodes. Electron apps with only window/menu chrome may need --force-renderer-accessibility to expose renderer content."
-)]
-impl ServerHandler for ComputerUseLinux {}
+/// Server instructions for control mode, where the agent drives the desktop.
+const CONTROL_INSTRUCTIONS: &str = "Begin every turn that uses Computer Use by calling get_app_state. If diagnostics report disabled GNOME accessibility, call setup_accessibility before asking the user to retry. Use list_windows/focused_window before targeted keyboard input. If diagnostics report windowing.can_list_windows=false on GNOME, call setup_window_targeting to install the optional GNOME Shell extension backend, then ask the user to log out and back in if the setup report says a shell reload is required. This Linux backend can capture size-bounded screenshots through GNOME Shell or XDG Desktop Portal, read AT-SPI trees with action/value metadata, invoke native AT-SPI actions, set AT-SPI values or editable text, list/focus compositor windows through registered Linux window backends when the session permits it, attach best-effort terminal tty/process metadata to terminal windows, send coordinate or element-targeted click/scroll/drag input through the Wayland remote desktop portal when available, and send literal type_text through KDE clipboard integration on Plasma Wayland, wtype on compatible Wayland compositors, or portal keysyms on other Wayland sessions. Portal text startup or conversion failures return an error without replaying through ydotool. GNOME preflights the complete text against every configured keyboard layout group because the background reader cannot establish the active group; rejected text can use set_value on an editable field. Raw ydotool text is limited to printable ASCII, tab and newline, uses US physical key positions, and requires checking the resulting field contents under the active layout. Screenshot results include width/height for the returned image plus coordinate_width/coordinate_height and scale for desktop coordinate conversion; request more detail with max_width, max_height, max_bytes, format=jpeg, quality, or a smaller target/crop instead of relying on unbounded screenshots. Mutating tools (click, type_text, press_key, scroll, drag, perform_action, set_value, activate_window, move_window, resize_window) accept optional screenshot_after (true, \"screen\", or \"window\") with format/quality/scale/max_width/max_height/max_bytes and optional include_tree=true to return post-action observation in the same tool call. Tools with readOnlyHint=false may mutate local desktop or application state; hosts should require approval for actions that can submit, delete, send, purchase, or overwrite data. For element-targeted actions, prefer element_index from the latest get_app_state result; click, perform_action, and set_value can also use semantic role/name/text/states selectors when the target is unique. type_text and press_key accept optional window_id, pid, app_id, wm_class, title, tty, terminal_pid, terminal_command, or terminal_cwd selectors and refuse targeted input if focus cannot be verified. After targeted keyboard input, results append focused-element feedback from AT-SPI (role, name, editable) and warn when a concrete non-terminal focus is not editable. Exact window focus alone does not suppress a missing-focus warning; only a complete scoped tree containing window/menu chrome without content makes it informational. Terminals accept keyboard input without an EditableText interface. On Hyprland, wtype uses a single literal argument after -- to avoid stdin keymap-refresh corruption; text is visible in process arguments, so confirmed password fields are rejected (use set_value). Terminals and ambiguous fields, with or without AT-SPI, use private stdin for at most 100 Unicode characters per call; split larger input into smaller calls or expose accessibility. Input classification has its own 1500 ms budget, independent of the 250 ms cosmetic indicator timeout. Other compatible compositors retain stdin. The wtype path rejects NUL and more than 131071 UTF-8 bytes before focus or indicators. X11 xdotool can silently substitute symbols under non-US XKB layouts (reported with br/ABNT2) or changing keymap state; inspect the text before pressing Enter or submitting it. A successful type_text result confirms dispatch only; every text backend leaves field contents unverified. Re-observe the target before retrying. Screenshot, click, and input results warn when the target window or coordinate is partially or fully off-screen; use move_window/resize_window (GNOME Shell extension backend) to bring a window fully on-screen before retrying. scroll accepts the same window targeting and relative coordinates as click. get_app_state returns a compact readiness block by default; pass verbose=true for the full diagnostics dump. Scope get_app_state with app_name_or_bundle_identifier or a window target (window_id, pid, app_id, wm_class, title); without one it returns the whole desktop AT-SPI tree, reports tree_scoped=false, and warns in message, which can flood context. accessibility_tree_truncated=true means the node, depth, or read budget stopped traversal with unread elements left; recover by scoping to a narrower app or window target and raising max_nodes or max_depth (hard caps 2000 and 64), not by lowering max_nodes. Electron apps with only window/menu chrome may need --force-renderer-accessibility to expose renderer content.";
+
+#[tool_handler(router = self.mcp_tool_router())]
+impl ServerHandler for ComputerUseLinux {
+    fn get_info(&self) -> rmcp::model::ServerConfig {
+        rmcp::model::ServerConfig::new(
+            rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .build(),
+        )
+        .with_server_info(rmcp::model::Implementation::new(
+            "computer-use-linux",
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .with_instructions(
+            match self.mode {
+                ServerMode::Control => CONTROL_INSTRUCTIONS,
+                ServerMode::Guide => crate::guide::GUIDE_INSTRUCTIONS,
+            }
+            .to_string(),
+        )
+    }
+}
 
 fn shell_execution_enabled() -> bool {
     shell_execution_enabled_value(env::var(SHELL_ENABLE_ENV).ok().as_deref())
@@ -2435,8 +2699,11 @@ async fn execute_shell(params: RunShellParams) -> RunShellOutput {
     }
 }
 
-pub async fn serve_mcp() -> Result<()> {
-    let server = ComputerUseLinux::default();
+pub async fn serve_mcp(mode: ServerMode) -> Result<()> {
+    let server = ComputerUseLinux {
+        mode,
+        ..ComputerUseLinux::default()
+    };
     let indicator = Arc::clone(&server.indicator);
     let running = server.serve(rmcp::transport::stdio()).await?;
     // Legacy initialization supplies the client name through the peer.
@@ -3326,6 +3593,298 @@ struct ActionOutput {
     received: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+struct ShowGuidanceParams {
+    /// Short imperative instruction for the user, e.g. "Click File, then Import File…". Up to 280 characters are shown on screen.
+    instruction: String,
+    /// Element to point at, from the latest get_app_state.
+    #[serde(default)]
+    element_index: Option<u32>,
+    /// Semantic selector: accessible role of the element to point at.
+    #[serde(default)]
+    role: Option<String>,
+    /// Semantic selector: accessible name of the element to point at.
+    #[serde(default)]
+    name: Option<String>,
+    /// Semantic selector: text content of the element to point at.
+    #[serde(default)]
+    text: Option<String>,
+    /// Semantic selector: states the element must have.
+    #[serde(default)]
+    states: Vec<String>,
+    /// Desktop coordinate x pixel to point at (or window-crop pixel with relative=true).
+    #[serde(default)]
+    x: Option<i32>,
+    /// Desktop coordinate y pixel to point at (or window-crop pixel with relative=true).
+    #[serde(default)]
+    y: Option<i32>,
+    /// Interpret x/y from the window screenshot crop origin. Requires a window target. The window is not raised or focused.
+    #[serde(default)]
+    relative: Option<bool>,
+    #[serde(default)]
+    window_id: Option<u64>,
+    #[serde(default)]
+    pid: Option<u32>,
+    #[serde(default)]
+    app_id: Option<String>,
+    #[serde(default)]
+    wm_class: Option<String>,
+    #[serde(default)]
+    window_title: Option<String>,
+    /// Key chord the user should press, e.g. "Ctrl+Shift+E"; shown as keycaps.
+    #[serde(default)]
+    keys: Option<String>,
+    /// Literal text the user should type; shown in the hint. Never pass passwords or other secrets.
+    #[serde(default)]
+    text_to_type: Option<String>,
+}
+
+impl ShowGuidanceParams {
+    fn window_target(&self) -> Option<WindowTarget> {
+        if self.window_id.is_none()
+            && self.pid.is_none()
+            && self.app_id.is_none()
+            && self.wm_class.is_none()
+            && self.window_title.is_none()
+        {
+            return None;
+        }
+        Some(WindowTarget {
+            window_id: self.window_id,
+            pid: self.pid,
+            app_id: self.app_id.clone(),
+            wm_class: self.wm_class.clone(),
+            title: self.window_title.clone(),
+            ..WindowTarget::default()
+        })
+    }
+
+    fn selector(&self) -> ElementSelector<'_> {
+        ElementSelector {
+            role: self.role.as_deref(),
+            name: self.name.as_deref(),
+            text: self.text.as_deref(),
+            states: &self.states,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct GuidancePoint {
+    x: i32,
+    y: i32,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct GuidanceElement {
+    element_index: u32,
+    role: String,
+    name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct ShowGuidanceOutput {
+    ok: bool,
+    /// Whether the on-screen overlay received the hint. When false, describe the location in words.
+    overlay_shown: bool,
+    instruction: String,
+    /// Where the pointer points, in desktop coordinate pixels.
+    point: Option<GuidancePoint>,
+    /// Outlined target area, in desktop coordinate pixels.
+    region: Option<Bounds>,
+    element: Option<GuidanceElement>,
+    message: String,
+}
+
+impl ShowGuidanceOutput {
+    fn failed(instruction: String, message: &str) -> Self {
+        Self {
+            ok: false,
+            overlay_shown: false,
+            instruction,
+            point: None,
+            region: None,
+            element: None,
+            message: message.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct ClearGuidanceOutput {
+    ok: bool,
+    overlay_cleared: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
+struct WaitForUserParams {
+    /// Longest wait in seconds (default 60, max 300).
+    #[serde(default)]
+    timeout_secs: Option<u64>,
+    /// How long a change must stay stable before returning, in milliseconds (default 1500, max 10000), so typing or multi-click steps finish first.
+    #[serde(default)]
+    settle_ms: Option<u64>,
+    /// App whose accessibility tree to watch. Defaults to the app focused when the wait starts.
+    #[serde(default)]
+    app_name_or_bundle_identifier: Option<String>,
+    /// Process id of the app whose accessibility tree to watch.
+    #[serde(default)]
+    pid: Option<u32>,
+    /// Remove the on-screen hint once a change is seen (default true).
+    #[serde(default)]
+    clear_guidance: Option<bool>,
+    #[serde(flatten)]
+    capture: PostActionCaptureParams,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct WaitForUserOutput {
+    /// True when the user changed something this tool can observe.
+    changed: bool,
+    /// True when the wait ended without any change.
+    timed_out: bool,
+    waited_ms: u64,
+    /// What changed, in plain language.
+    changes: Vec<String>,
+    focused_window: Option<WindowInfo>,
+    focused_element: Option<FocusedElementSummary>,
+    guidance_cleared: bool,
+    message: String,
+}
+
+#[derive(Debug, Clone, Serialize, JsonSchema)]
+struct WaitForUserToolOutput {
+    #[serde(flatten)]
+    output: WaitForUserOutput,
+    #[serde(flatten)]
+    observation: PostActionObservation,
+}
+
+/// What `wait_for_user` watches besides window and keyboard focus.
+struct GuideWatch {
+    app_filter: Option<String>,
+    pid: Option<u32>,
+}
+
+/// Where `show_guidance` points.
+#[derive(Default)]
+struct GuidanceTarget {
+    point: Option<(i32, i32)>,
+    region: Option<(i32, i32, u32, u32)>,
+    element: Option<GuidanceElement>,
+}
+
+impl ComputerUseLinux {
+    async fn resolve_guidance_target(
+        &self,
+        params: &ShowGuidanceParams,
+    ) -> std::result::Result<GuidanceTarget, String> {
+        let window_target = params.window_target();
+        if let Some((x, y)) = params.x.zip(params.y) {
+            if params.relative != Some(true) {
+                return Ok(GuidanceTarget {
+                    point: Some((x, y)),
+                    ..GuidanceTarget::default()
+                });
+            }
+            let target = window_target
+                .ok_or_else(|| "Relative coordinates require a window target.".to_string())?;
+            let windows = list_windows()
+                .await
+                .map_err(|error| format!("Could not list windows: {error:#}"))?;
+            let window = resolve_window_target(&windows, &target)
+                .map_err(|error| format!("Could not resolve the target window: {error:#}"))?;
+            let map = self.window_coordinate_map(window).await?;
+            let (origin_x, origin_y, width, height) = map.capture_rect;
+            if x < 0 || y < 0 || x as u32 >= width || y as u32 >= height {
+                return Err("Relative coordinates must be inside the target window.".to_string());
+            }
+            let point = origin_x
+                .checked_add(x)
+                .zip(origin_y.checked_add(y))
+                .ok_or_else(|| "Relative coordinates overflowed.".to_string())?;
+            return Ok(GuidanceTarget {
+                point: Some(point),
+                ..GuidanceTarget::default()
+            });
+        }
+        if params.x.is_some() || params.y.is_some() {
+            return Err("Pass both x and y.".to_string());
+        }
+        let selector = params.selector();
+        if params.element_index.is_none() && selector.is_empty() {
+            return Ok(GuidanceTarget::default());
+        }
+        let node = self.resolve_cached_node(
+            params.element_index,
+            &selector,
+            ElementResolvePurpose::Click,
+        )?;
+        let element = GuidanceElement {
+            element_index: node.index,
+            role: node.role.clone(),
+            name: node.name.clone(),
+        };
+        let bounds = node.bounds.as_ref();
+        let point = bounds.and_then(bounds_center).ok_or_else(|| {
+            format!(
+                "element_index {} ({}) has no on-screen bounds. Point at a visible parent, use coordinates from a screenshot, or describe the location in words.",
+                element.element_index, element.role
+            )
+        })?;
+        let region = bounds.map(|bounds| {
+            (
+                bounds.x,
+                bounds.y,
+                bounds.width.max(0) as u32,
+                bounds.height.max(0) as u32,
+            )
+        });
+        Ok(GuidanceTarget {
+            point: Some(point),
+            region,
+            element: Some(element),
+        })
+    }
+
+    /// Bounded snapshot of what the user can visibly change.
+    async fn desktop_fingerprint(
+        &self,
+        watch: &GuideWatch,
+        window: Option<WindowInfo>,
+    ) -> DesktopFingerprint {
+        let focus_pid = window.as_ref().and_then(|window| window.pid);
+        let focused_element = match timeout(
+            Duration::from_millis(1500),
+            probe_focused_element(focus_pid),
+        )
+        .await
+        {
+            Ok(Ok(FocusProbe::Found(summary))) => Some(ElementMark::of(&summary)),
+            _ => None,
+        };
+        let tree = if watch.app_filter.is_some() || watch.pid.is_some() {
+            snapshot_accessibility_tree(
+                watch.app_filter.as_deref(),
+                watch.pid,
+                WAIT_FOR_USER_TREE_NODES,
+                WAIT_FOR_USER_TREE_DEPTH,
+            )
+            .await
+            .ok()
+            .filter(|snapshot| snapshot.scoped && !snapshot.nodes.is_empty())
+            .map(|snapshot| TreeMark::of(&snapshot.nodes))
+        } else {
+            None
+        };
+        DesktopFingerprint {
+            focused_window: window.as_ref().map(WindowMark::of),
+            focused_element,
+            tree,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 struct ActionToolOutput {
     #[serde(flatten)]
@@ -4061,6 +4620,14 @@ impl ComputerUseLinux {
             .focused_window
             .as_ref()
             .unwrap_or(&focus.requested_window);
+        self.window_coordinate_map(window).await
+    }
+
+    /// Maps a window to its rectangle in screenshot pixels.
+    async fn window_coordinate_map(
+        &self,
+        window: &WindowInfo,
+    ) -> std::result::Result<WindowCoordinateMap, String> {
         if !matches!(
             window.backend.as_str(),
             GNOME_SHELL_EXTENSION_BACKEND | GNOME_SHELL_INTROSPECT_BACKEND | KWIN_BACKEND
@@ -11156,5 +11723,223 @@ exit 1
             .as_str()
             .unwrap()
             .contains("WARNING: X11 keyboard layout"));
+    }
+}
+
+#[cfg(test)]
+mod guide_mode_tests {
+    use super::*;
+    use crate::atspi_tree::Bounds;
+
+    fn node(index: u32, bounds: Option<Bounds>) -> AccessibilityNode {
+        AccessibilityNode {
+            index,
+            parent_index: None,
+            depth: 0,
+            object_ref: format!(":1.1/{index}"),
+            role: "panel".to_string(),
+            name: None,
+            description: None,
+            child_count: 0,
+            bounds,
+            states: vec!["showing".to_string(), "visible".to_string()],
+            actions: Vec::new(),
+            value: None,
+            text: None,
+            supports_editable_text: false,
+        }
+    }
+
+    fn guide_backend() -> ComputerUseLinux {
+        ComputerUseLinux {
+            mode: ServerMode::Guide,
+            ..ComputerUseLinux::default()
+        }
+    }
+
+    #[test]
+    fn guide_mode_exposes_observation_and_guidance_but_no_input() {
+        let names: std::collections::BTreeSet<String> = guide_backend()
+            .mcp_tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        for expected in [
+            "doctor",
+            "setup_accessibility",
+            "setup_window_targeting",
+            "list_apps",
+            "list_windows",
+            "focused_window",
+            "get_app_state",
+            "screenshot",
+            "show_guidance",
+            "clear_guidance",
+            "wait_for_user",
+        ] {
+            assert!(names.contains(expected), "missing {expected} in {names:?}");
+        }
+        for removed in crate::guide::CONTROL_TOOLS {
+            assert!(!names.contains(*removed), "guide mode exposes {removed}");
+        }
+        let control: std::collections::BTreeSet<String> = ComputerUseLinux::default()
+            .mcp_tool_router()
+            .list_all()
+            .into_iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        for guide_only in crate::guide::GUIDE_TOOLS {
+            assert!(
+                !control.contains(*guide_only),
+                "control mode exposes {guide_only}"
+            );
+        }
+        assert!(control.contains("click"));
+    }
+
+    #[test]
+    fn guide_tools_are_read_only() {
+        for tool in guide_backend().mcp_tool_router().list_all() {
+            if crate::guide::GUIDE_TOOLS.contains(&tool.name.as_ref()) {
+                let annotations = tool.annotations.expect("guide tools carry annotations");
+                assert_eq!(annotations.read_only_hint, Some(true), "{}", tool.name);
+                assert_eq!(annotations.destructive_hint, Some(false), "{}", tool.name);
+            }
+        }
+    }
+
+    #[test]
+    fn server_instructions_follow_the_mode() {
+        let control = ComputerUseLinux::default().get_info();
+        let guide = guide_backend().get_info();
+        assert_eq!(control.server_info.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(guide.server_info.name, "computer-use-linux");
+        assert!(control
+            .instructions
+            .as_deref()
+            .unwrap()
+            .starts_with("Begin every turn that uses Computer Use by calling get_app_state"));
+        let guide = guide.instructions.unwrap();
+        assert!(guide.starts_with("Guide mode:"));
+        assert!(guide.contains("show_guidance") && guide.contains("wait_for_user"));
+    }
+
+    #[tokio::test]
+    async fn show_guidance_points_at_cached_elements_without_input() {
+        let backend = guide_backend();
+        let mut button = node(
+            3,
+            Some(Bounds {
+                x: 100,
+                y: 40,
+                width: 60,
+                height: 20,
+            }),
+        );
+        button.role = "push button".to_string();
+        button.name = Some("Import".to_string());
+        backend.cache_nodes(&[node(0, None), button]);
+        backend.cache_desktop_size(1920, 1080);
+        let Json(output) = backend
+            .show_guidance(Parameters(ShowGuidanceParams {
+                instruction: "  Click Import  ".to_string(),
+                name: Some("Import".to_string()),
+                ..ShowGuidanceParams::default()
+            }))
+            .await;
+        assert!(output.ok, "{}", output.message);
+        assert_eq!(output.instruction, "Click Import");
+        let point = output.point.unwrap();
+        assert_eq!((point.x, point.y), (130, 50));
+        let region = output.region.unwrap();
+        assert_eq!(
+            (region.x, region.y, region.width, region.height),
+            (100, 40, 60, 20)
+        );
+        assert_eq!(output.element.unwrap().element_index, 3);
+        // Unit-test servers never reach a real overlay.
+        assert!(!output.overlay_shown);
+        assert!(output.message.contains("No input was sent"));
+        assert!(output.message.contains("describe the location"));
+    }
+
+    #[tokio::test]
+    async fn show_guidance_rejects_unusable_targets() {
+        let backend = guide_backend();
+        backend.cache_nodes(&[node(0, None)]);
+        let empty = backend
+            .show_guidance(Parameters(ShowGuidanceParams::default()))
+            .await
+            .0;
+        assert!(!empty.ok);
+        let boundless = backend
+            .show_guidance(Parameters(ShowGuidanceParams {
+                instruction: "Open the menu".to_string(),
+                element_index: Some(0),
+                ..ShowGuidanceParams::default()
+            }))
+            .await
+            .0;
+        assert!(!boundless.ok);
+        assert!(boundless.message.contains("no on-screen bounds"));
+        let half = backend
+            .show_guidance(Parameters(ShowGuidanceParams {
+                instruction: "Here".to_string(),
+                x: Some(5),
+                ..ShowGuidanceParams::default()
+            }))
+            .await
+            .0;
+        assert!(!half.ok);
+        let relative = backend
+            .show_guidance(Parameters(ShowGuidanceParams {
+                instruction: "Here".to_string(),
+                x: Some(5),
+                y: Some(5),
+                relative: Some(true),
+                ..ShowGuidanceParams::default()
+            }))
+            .await
+            .0;
+        assert!(!relative.ok);
+        assert!(relative.message.contains("window target"));
+    }
+
+    #[tokio::test]
+    async fn show_guidance_warns_about_off_screen_and_unplaced_points() {
+        let backend = guide_backend();
+        let unplaced = backend
+            .show_guidance(Parameters(ShowGuidanceParams {
+                instruction: "Look here".to_string(),
+                x: Some(10),
+                y: Some(10),
+                ..ShowGuidanceParams::default()
+            }))
+            .await
+            .0;
+        assert!(unplaced.ok);
+        assert!(unplaced.message.contains("first full-desktop capture"));
+        backend.cache_desktop_size(800, 600);
+        let off_screen = backend
+            .show_guidance(Parameters(ShowGuidanceParams {
+                instruction: "Look here".to_string(),
+                x: Some(900),
+                y: Some(10),
+                ..ShowGuidanceParams::default()
+            }))
+            .await
+            .0;
+        assert!(off_screen.ok);
+        assert!(off_screen.message.contains("outside the captured desktop"));
+        let instruction_only = backend
+            .show_guidance(Parameters(ShowGuidanceParams {
+                instruction: "Save your work first".to_string(),
+                ..ShowGuidanceParams::default()
+            }))
+            .await
+            .0;
+        assert!(instruction_only.ok);
+        assert!(instruction_only.point.is_none());
     }
 }
